@@ -1,185 +1,209 @@
 #!/bin/sh
 # ============================================================
-#  OpenWrt/ImmortalWrt overlay 全自动扩容脚本 (squashfs+f2fs)
+#  OpenWrt/ImmortalWrt overlay 全自动扩容 - 控制机一键版
 #
-#  适用: x86_64 官方镜像 (squashfs combined), eMMC/SATA/NVMe/虚拟磁盘
-#  原理: 与 openwrt.org expand_root 相同思路, 适配 f2fs overlay
-#        1) fdisk 扩分区(保留起始扇区, 专家模式改回原 PARTUUID, grub 免改)
-#        2) 写入 uci-defaults 自启脚本
-#        3) 重启 -> 自动 losetup+resize.f2fs -> 自动重启 -> 完成
+#  用法:  ./expand-overlay.sh [目标IP] [root密码]
+#  例:    ./expand-overlay.sh 192.168.1.1
+#         ./expand-overlay.sh 192.168.2.250 zz0770
 #
-#  用法: 上传到机器后  sh expand-overlay.sh
-#        或        wget -qO- http://<vps>/expand-overlay.sh | sh
-#  执行后需要 2 次自动重启, 全程无需人工介入
+#  前置:  控制机需安装 sshpass; 目标机为 x86_64 squashfs+f2fs 官方镜像
+#         目标机只需可达 IP(默认192.168.1.1, 新装默认), 无需配置网络/apk源
 #
-#  v1.2 修复: 移除阶段1的 fsck.f2fs -f (挂载中的 f2fs 卷不可 fsck, 会损坏)
-#             移除等待 30s, 立即重启
+#  流程:  1) 自动下载编译好的工具(f2fs-tools/f2loop)到本机
+#         2) 上传工具到目标机 /boot (vfat, failsafe下可用)
+#         3) 目标机: fdisk 扩分区(保留起始扇区+原PARTUUID) + grub 默认进 failsafe
+#         4) 自动重启 -> failsafe (overlay未挂载, 可安全离线 resize)
+#         5) 目标机: losetup + fsck + 日志重放 + resize.f2fs
+#         6) 恢复 grub 正常引导 -> 自动重启 -> 扩容完成
+#
+#  原理:  f2fs 的 resize 必须离线(官方 expand_root 仅支持 ext4 在线 resize),
+#         failsafe 模式跳过 overlay 挂载, 是唯一可靠的离线扩容路径
 # ============================================================
 
 set -u
+VERSION="2.0"
+
+TARGET_IP="${1:-192.168.1.1}"
+TARGET_PASS="${2:-}"
+GH_BASE="https://raw.githubusercontent.com/Jioyzen/openwrt-expand-overlay/main"
+TOOL_DIR="${TOOL_DIR:-/tmp/openwrt-expand-tools}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8"
+
+echo "=== OpenWrt overlay 全自动扩容 (控制机版 v$VERSION) ==="
+echo "目标: $TARGET_IP  密码: ${TARGET_PASS:+已设置}${TARGET_PASS:-空(新装默认)}"
+
+# ---------- 0. 控制机前置检查 ----------
+command -v sshpass >/dev/null 2>&1 || { echo "ERROR: 控制机缺少 sshpass (apt install sshpass)"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "ERROR: 控制机缺少 curl"; exit 1; }
+
+# ---------- 1. 下载工具 ----------
+echo "--- [1] 下载工具到控制机 ---"
+mkdir -p "$TOOL_DIR"
+for f in f2fs-tools f2loop; do
+    if [ ! -f "$TOOL_DIR/$f" ]; then
+        echo "下载 $f ..."
+        curl -sL --max-time 60 -o "$TOOL_DIR/$f" "$GH_BASE/tools/$f" || { echo "ERROR: 下载 $f 失败"; exit 1; }
+        chmod +x "$TOOL_DIR/$f"
+    fi
+done
+echo "工具就绪: $(ls -la $TOOL_DIR/f2fs-tools $TOOL_DIR/f2loop | awk '{print $NF, $5"B"}')"
+
+# ---------- 2. 上传工具到目标机 /boot ----------
+echo "--- [2] 上传工具到目标机 /boot/f2fs/ ---"
+ssh_run() { sshpass -p "$TARGET_PASS" ssh $SSH_OPTS "root@$TARGET_IP" "$@"; }
+ssh_run "mkdir -p /boot/f2fs" 2>/dev/null || { echo "ERROR: 无法连接目标机 $TARGET_IP (密码是否正确?)"; exit 1; }
+cat "$TOOL_DIR/f2fs-tools" | ssh_run "cat > /boot/f2fs/f2fs-tools && chmod +x /boot/f2fs/f2fs-tools"
+cat "$TOOL_DIR/f2loop"     | ssh_run "cat > /boot/f2fs/f2loop && chmod +x /boot/f2fs/f2loop"
+ssh_run "ls -la /boot/f2fs/" || exit 1
+
+# ---------- 3. 阶段0: 扩分区 + 配置 failsafe ----------
+echo "--- [3] 目标机: 检测 + 扩分区 + 配置 failsafe ---"
+ssh_run 'sh -s' <<'STAGE0' || true
+#!/bin/sh
 LOG=/tmp/expand-overlay.log
-echo "=== OpenWrt overlay 全自动扩容 v1.2 ===" | tee $LOG
+echo "=== stage0 $(date) ===" > $LOG
 
-# ---------- 0. 环境检测 ----------
-echo "--- 0. 环境检测 ---" | tee -a $LOG
-
-# 确认是 squashfs+f2fs overlay 布局 (与官方 x86 combined 镜像一致)
-if ! grep -q "squashfs" /proc/mounts; then
-    echo "ERROR: 未检测到 squashfs 只读根 (/rom), 本脚本仅支持 squashfs+f2fs 官方镜像布局" | tee -a $LOG
-    exit 1
-fi
-
-# 找 /overlay 挂载的源设备 (mountinfo: $5=mountpoint, $9=source)
-OVERLAY_SRC="$(awk '$5=="/overlay"{print $9}' /proc/self/mountinfo)"
-echo "overlay source: $OVERLAY_SRC" | tee -a $LOG
-[ -z "$OVERLAY_SRC" ] && { echo "ERROR: 未找到 /overlay 挂载源" | tee -a $LOG; exit 1; }
-case "$OVERLAY_SRC" in
-    /dev/loop*) LOOP_DEV="$OVERLAY_SRC" ;;
-    *) echo "WARN: /overlay 不在 loop 上 ($OVERLAY_SRC), 可能是 ext4 布局, 本脚本不适用" | tee -a $LOG; exit 1 ;;
-esac
-
-# 找 root 分区块设备 (mountinfo: /rom 行的 major:minor)
-ROOT_MAJMIN="$(awk '$5=="/rom"{print $3}' /proc/self/mountinfo)"
-ROOT_SRC="$(awk '$5=="/rom"{print $9}' /proc/self/mountinfo)"
-echo "rom mount: majmin=$ROOT_MAJMIN src=$ROOT_SRC" | tee -a $LOG
-
-# 从 sysfs 解析真实块设备路径
-ROOT_SYS="$(readlink -f /sys/dev/block/$ROOT_MAJMIN 2>/dev/null)"
-ROOT_DEV="/dev/${ROOT_SYS##*/}"               # /dev/mmcblk0p2
-ROOT_DISK="/dev/$(basename "${ROOT_SYS%/*}")"  # /dev/mmcblk0
-ROOT_PART="${ROOT_DEV##*[^0-9]}"              # 2
-echo "root: $ROOT_DEV (disk=$ROOT_DISK part=$ROOT_PART)" | tee -a $LOG
-[ -b "$ROOT_DEV" ] || { echo "ERROR: 无法解析 root 设备 $ROOT_DEV" | tee -a $LOG; exit 1; }
-
-# f2fs 卷在 root 分区内的偏移 (字节), 从 loop 设备读
-OFFSET="$(cat /sys/block/${LOOP_DEV#/dev/}/loop/offset 2>/dev/null)"
-echo "f2fs offset: $OFFSET bytes" | tee -a $LOG
-[ -z "$OFFSET" ] && { echo "ERROR: 无法读取 f2fs offset" | tee -a $LOG; exit 1; }
-
-# 当前 grub 里的 PARTUUID (必须保留, 否则引导失败)
-OLD_PARTUUID="$(grep -o 'PARTUUID=[^ ]*' /boot/grub/grub.cfg 2>/dev/null | head -1 | cut -d= -f2)"
-echo "current PARTUUID: $OLD_PARTUUID" | tee -a $LOG
-[ -z "$OLD_PARTUUID" ] && { echo "ERROR: 无法从 grub.cfg 读取 PARTUUID" | tee -a $LOG; exit 1; }
-
-# 起始扇区 (删除重建时必须保持不变)
-START_SECTOR="$(fdisk -l "$ROOT_DISK" 2>/dev/null | awk -v d="$ROOT_DEV" '$1==d{print $2}')"
-echo "root part start sector: $START_SECTOR" | tee -a $LOG
-[ -z "$START_SECTOR" ] && { echo "ERROR: 无法读取起始扇区" | tee -a $LOG; exit 1; }
-
-# 磁盘总扇区 (GPT 会预留末尾)
-DISK_SECTORS="$(cat /sys/class/block/${ROOT_DISK#/dev/}/size)"
-echo "disk sectors: $DISK_SECTORS" | tee -a $LOG
-
-# 已经扩过了? (f2fs 卷大小 > 600MB 说明已完成, 官方默认 300M)
-CUR_OVERLAY_KB="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $2}')"
-if [ "${CUR_OVERLAY_KB:-0}" -gt 600000 ]; then
-    echo "overlay 已是 ${CUR_OVERLAY_KB} KB, 无需扩容, 退出" | tee -a $LOG
+# 已扩容则跳过
+CUR=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $2}')
+if [ "${CUR:-0}" -gt 600000 ]; then
+    echo "overlay 已是 ${CUR}KB, 无需扩容" | tee -a $LOG
     exit 0
 fi
+echo "overlay 当前: ${CUR}KB" | tee -a $LOG
 
-# ---------- 1. 安装依赖 ----------
-echo "--- 1. 安装依赖 (f2fs-tools losetup) ---" | tee -a $LOG
-if ! command -v resize.f2fs >/dev/null 2>&1 || ! command -v losetup >/dev/null 2>&1; then
-    apk update >>$LOG 2>&1 || { echo "ERROR: apk update 失败" | tee -a $LOG; exit 1; }
-    apk add f2fs-tools losetup >>$LOG 2>&1 || { echo "ERROR: apk add f2fs-tools losetup 失败" | tee -a $LOG; exit 1; }
-fi
-command -v resize.f2fs >/dev/null 2>&1 || { echo "ERROR: resize.f2fs 不可用" | tee -a $LOG; exit 1; }
-command -v losetup >/dev/null 2>&1 || { echo "ERROR: losetup 不可用" | tee -a $LOG; exit 1; }
-echo "依赖就绪: $(command -v resize.f2fs), $(command -v losetup)" | tee -a $LOG
+# 检测: /overlay 挂载源 + /rom 设备 + offset + PARTUUID + 起始扇区
+OVERLAY_SRC=$(awk '$5=="/overlay"{print $9}' /proc/self/mountinfo)
+ROOT_MAJMIN=$(awk '$5=="/rom"{print $3}' /proc/self/mountinfo)
+ROOT_SYS=$(readlink -f /sys/dev/block/$ROOT_MAJMIN 2>/dev/null)
+ROOT_DEV="/dev/${ROOT_SYS##*/}"
+ROOT_DISK="/dev/$(basename "${ROOT_SYS%/*}")"
+ROOT_PART="${ROOT_DEV##*[^0-9]}"
+OFFSET=$(cat /sys/block/${OVERLAY_SRC#/dev/}/loop/offset 2>/dev/null)
+OLD_PARTUUID=$(grep -o 'PARTUUID=[^ ]*' /boot/grub/grub.cfg 2>/dev/null | head -1 | cut -d= -f2)
+START_SECTOR=$(fdisk -l "$ROOT_DISK" 2>/dev/null | awk -v d="$ROOT_DEV" '$1==d{print $2}')
 
-# ---------- 2. 备份 grub ----------
-echo "--- 2. 备份 grub.cfg ---" | tee -a $LOG
+echo "root=$ROOT_DEV disk=$ROOT_DISK part=$ROOT_PART offset=$OFFSET start=$START_SECTOR uuid=$OLD_PARTUUID" | tee -a $LOG
+[ -n "$OFFSET" ] && [ -n "$OLD_PARTUUID" ] && [ -n "$START_SECTOR" ] || { echo "ERROR: 检测失败" | tee -a $LOG; exit 1; }
+
+# 备份 grub
 cp /boot/grub/grub.cfg /boot/grub/grub.cfg.bak-expand 2>/dev/null
-echo "备份: /boot/grub/grub.cfg.bak-expand" | tee -a $LOG
 
-# ---------- 3. fdisk 扩分区 (保留起始扇区 + 改回原 GUID) ----------
-echo "--- 3. fdisk 扩分区 p$ROOT_PART ---" | tee -a $LOG
+# fdisk 扩分区: 删 p2 重建(保留起始扇区) + 专家模式改回原 PARTUUID
+echo "--- fdisk 扩分区 ---" | tee -a $LOG
 {
-    echo "d"
-    echo "$ROOT_PART"
-    echo "n"
-    echo "$ROOT_PART"
-    echo "$START_SECTOR"
-    echo ""                       # 默认到 GPT 允许的末尾
-    echo "x"
-    echo "u"
-    echo "$ROOT_PART"
-    echo "$OLD_PARTUUID"
-    echo "r"
+    echo "d"; echo "$ROOT_PART"
+    echo "n"; echo "$ROOT_PART"; echo "$START_SECTOR"; echo ""
+    echo "x"; echo "u"; echo "$ROOT_PART"; echo "$OLD_PARTUUID"; echo "r"
     echo "w"
 } | fdisk "$ROOT_DISK" >>$LOG 2>&1
 RC=$?
-[ $RC -ne 0 ] && { echo "ERROR: fdisk 失败 (rc=$RC)" | tee -a $LOG; exit 1; }
-echo "分区已扩展" | tee -a $LOG
+[ $RC -ne 0 ] && { echo "ERROR: fdisk 失败 rc=$RC" | tee -a $LOG; exit 1; }
 fdisk -l "$ROOT_DISK" 2>/dev/null | grep "$ROOT_DEV" | tee -a $LOG
 
-# ---------- 4. 写 uci-defaults 自动扩容脚本 (阶段1, 动态检测) ----------
-echo "--- 4. 写入 uci-defaults 自动扩容脚本 ---" | tee -a $LOG
-mkdir -p /etc/uci-defaults
-cat > /etc/uci-defaults/80-rootfs-resize <<'STAGE1'
+# grub 默认进 failsafe (default=1)
+sed -i 's/^set default="0"/set default="1"/' /boot/grub/grub.cfg
+grep "^set default" /boot/grub/grub.cfg | tee -a $LOG
+
+echo "--- 分区已扩, 重启进 failsafe ---" | tee -a $LOG
+sync
+reboot
+STAGE0
+
+# ---------- 4. 等待 failsafe ----------
+echo "--- [4] 等待 failsafe 上线 ($TARGET_IP) ---"
+FS_UP=""
+for i in $(seq 1 36); do
+    sleep 5
+    if timeout 6 sshpass -p "" ssh $SSH_OPTS root@$TARGET_IP \
+        'grep -q "failsafe=" /proc/cmdline && echo FS' 2>/dev/null | grep -q FS; then
+        echo "failsafe 上线 (~$((i*5))s)"
+        FS_UP=1
+        break
+    fi
+done
+[ -n "$FS_UP" ] || { echo "ERROR: failsafe 等待超时, 检查目标机 (可能 grub 未进入 failsafe)"; exit 1; }
+
+# ---------- 5. 阶段1: failsafe 离线扩容 ----------
+echo "--- [5] failsafe: 离线 fsck + resize.f2fs ---"
+sshpass -p "" ssh $SSH_OPTS root@$TARGET_IP 'sh -s' <<'STAGE1' || true
 #!/bin/sh
-# 阶段1: 重启后由 uci-defaults 自动执行 (开机时 uci_apply_defaults 运行一次)
-# 动态检测设备, 不依赖硬编码路径
-# v1.2: 移除 fsck.f2fs -f (挂载中的卷不可 fsck); 仅 mount/umount 重放日志 + resize
 LOG=/tmp/expand-stage1.log
-echo "=== [stage1] resize overlay f2fs ===" > $LOG
+echo "=== stage1 $(date) ===" > $LOG
+B=/tmp/boot/boot/f2fs
 
-# 已完成标记则跳过
-[ -e /etc/rootfs-resize-done ] && { echo "already done" >> $LOG; exit 1; }
+# 挂载 /boot (failsafe 下 / 是只读 squashfs, 挂载点用 /tmp)
+mkdir -p /tmp/boot
+mount -t vfat -o fmask=0000,dmask=0000,exec /dev/mmcblk0p1 /tmp/boot >>$LOG 2>&1
+echo "boot mounted: $(ls $B/ 2>/dev/null)" | tee -a $LOG
 
-OVERLAY_SRC="$(awk '$5=="/overlay"{print $9}' /proc/self/mountinfo)"
-ROOT_MAJMIN="$(awk '$5=="/rom"{print $3}' /proc/self/mountinfo)"
-ROOT_SYS="$(readlink -f /sys/dev/block/$ROOT_MAJMIN 2>/dev/null)"
+# 动态检测
+OVERLAY_SRC=$(awk '$5=="/overlay"{print $9}' /proc/self/mountinfo 2>/dev/null)
+ROOT_MAJMIN=$(awk '$5=="/rom"{print $3}' /proc/self/mountinfo)
+ROOT_SYS=$(readlink -f /sys/dev/block/$ROOT_MAJMIN 2>/dev/null)
 ROOT_DEV="/dev/${ROOT_SYS##*/}"
-OFFSET="$(cat /sys/block/${OVERLAY_SRC#/dev/}/loop/offset 2>/dev/null)"
+OFFSET=$(cat /sys/block/${OVERLAY_SRC#/dev/}/loop/offset 2>/dev/null)
+echo "root=$ROOT_DEV overlay_src=$OVERLAY_SRC offset=$OFFSET" | tee -a $LOG
 
-echo "root=$ROOT_DEV overlay_src=$OVERLAY_SRC offset=$OFFSET" >> $LOG
+# 绑定 loop -> p2+offset (离线, loop 空闲)
+$B/f2loop "$ROOT_DEV" "$OFFSET" /dev/loop0 2>&1 | tee -a $LOG
+echo "loop0 size: $(cat /sys/block/loop0/size) sectors" | tee -a $LOG
+[ "$(cat /sys/block/loop0/size 2>/dev/null)" -gt 1000000 ] || { echo "ERROR: loop0 太小" | tee -a $LOG; exit 1; }
 
-NEW_LOOP="$(losetup -f)"
-echo "new loop: $NEW_LOOP" >> $LOG
-losetup -o "$OFFSET" "$NEW_LOOP" "$ROOT_DEV" || { echo "losetup failed" >> $LOG; exit 1; }
-NEW_SIZE="$(cat /sys/block/${NEW_LOOP#/dev/}/size)"
-echo "new loop size: $NEW_SIZE sectors" >> $LOG
+# 多调用工具: 通过 symlink 触发模式
+ln -sf $B/f2fs-tools /tmp/fsck.f2fs
+ln -sf $B/f2fs-tools /tmp/resize.f2fs
 
-# 防御: 新 loop 必须大于旧卷 (290M=594176 sectors), 否则说明分区没扩成功
-if [ "${NEW_SIZE:-0}" -lt 1000000 ]; then
-    echo "ERROR: loop 太小 ($NEW_SIZE), 分区可能未扩大, 中止" >> $LOG
-    losetup -d "$NEW_LOOP" 2>/dev/null
-    exit 1
-fi
+# fsck (离线, 安全)
+echo "--- fsck ---" | tee -a $LOG
+/tmp/fsck.f2fs -f /dev/loop0 >>$LOG 2>&1
+echo "fsck rc=$?" | tee -a $LOG
 
-# mount/umount 重放日志 (unclean 时 resize 会拒绝; 挂载失败可容忍, 继续尝试 resize)
-mkdir -p /mnt/expand
-if mount -t f2fs "$NEW_LOOP" /mnt/expand >> $LOG 2>&1; then
-    sync
-    umount /mnt/expand >> $LOG 2>&1
-    echo "log replay OK" >> $LOG
-else
-    echo "log replay skipped (mount failed, 继续)" >> $LOG
-fi
+# mount/umount 重放日志
+echo "--- 日志重放 ---" | tee -a $LOG
+mkdir -p /tmp/mnt
+mount -t f2fs /dev/loop0 /tmp/mnt >>$LOG 2>&1 && { sync; umount /tmp/mnt >>$LOG 2>&1; echo "replay OK" | tee -a $LOG; } || echo "replay skipped" | tee -a $LOG
 
-# resize 到 loop 设备满
-resize.f2fs -f "$NEW_LOOP" >> $LOG 2>&1
+# resize (自动回答 y)
+echo "--- resize ---" | tee -a $LOG
+echo y | /tmp/resize.f2fs -f /dev/loop0 >>$LOG 2>&1
 RC=$?
-echo "resize.f2fs rc=$RC" >> $LOG
-losetup -d "$NEW_LOOP" 2>/dev/null
+echo "resize rc=$RC" | tee -a $LOG
+[ $RC -ne 0 ] && { echo "ERROR: resize 失败" | tee -a $LOG; exit 1; }
 
-if [ $RC -ne 0 ]; then
-    echo "RESIZE FAILED (rc=$RC), 保留现场供排查" >> $LOG
-    exit 1
-fi
+# 验证
+mkdir -p /tmp/mnt2
+mount -t f2fs /dev/loop0 /tmp/mnt2 >>$LOG 2>&1 && { df -h /tmp/mnt2 | tee -a $LOG; umount /tmp/mnt2; }
 
-touch /etc/rootfs-resize-done
-echo "扩容完成, 立即重启" >> $LOG
+# 恢复 grub 正常引导 (注意: vfat 根下有 boot/ 子目录)
+echo "--- 恢复 grub ---" | tee -a $LOG
+sed -i 's/^set default="1"/set default="0"/' /tmp/boot/boot/grub/grub.cfg
+grep "^set default" /tmp/boot/boot/grub/grub.cfg | tee -a $LOG
+
+# 清理 + 重启
+$B/f2loop --clear /dev/loop0 2>/dev/null
 sync
-reboot
-exit 1
+sleep 1
+reboot -f
 STAGE1
-chmod +x /etc/uci-defaults/80-rootfs-resize
-echo "已写入 /etc/uci-defaults/80-rootfs-resize" | tee -a $LOG
 
-# ---------- 5. 触发重启 ----------
-echo "--- 5. 分区已扩, 立即重启进入阶段1 ---" | tee -a $LOG
-echo "重启后无需任何操作, 将自动完成 f2fs 扩容并再次重启" | tee -a $LOG
-sync
-reboot
+# ---------- 6. 等待正常启动 + 验证 ----------
+echo "--- [6] 等待正常系统上线 ---"
+NB_UP=""
+for i in $(seq 1 36); do
+    sleep 5
+    R=$(timeout 6 sshpass -p "$TARGET_PASS" ssh $SSH_OPTS root@$TARGET_IP \
+        'grep -q "failsafe=" /proc/cmdline && echo FS || echo NB' 2>/dev/null)
+    if [ "$R" = "NB" ]; then
+        echo "正常系统上线 (~$((i*5))s)"
+        NB_UP=1
+        break
+    fi
+done
+[ -n "$NB_UP" ] || { echo "ERROR: 正常系统等待超时"; exit 1; }
+
+# 验证
+echo "--- [7] 验证 ---"
+sshpass -p "$TARGET_PASS" ssh $SSH_OPTS root@$TARGET_IP 'df -h / /overlay; echo; echo "grub: $(grep "^set default" /boot/grub/grub.cfg)"; echo "loop0: $(cat /sys/block/loop0/size) sectors"'
+
+echo
+echo "=== 扩容完成 ==="
