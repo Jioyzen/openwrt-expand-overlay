@@ -6,16 +6,19 @@
 #  原理: 与 openwrt.org expand_root 相同思路, 适配 f2fs overlay
 #        1) fdisk 扩分区(保留起始扇区, 专家模式改回原 PARTUUID, grub 免改)
 #        2) 写入 uci-defaults 自启脚本
-#        3) 重启 -> 自动 losetup+fsck+resize.f2fs -> 自动重启 -> 完成
+#        3) 重启 -> 自动 losetup+resize.f2fs -> 自动重启 -> 完成
 #
 #  用法: 上传到机器后  sh expand-overlay.sh
 #        或        wget -qO- http://<vps>/expand-overlay.sh | sh
 #  执行后需要 2 次自动重启, 全程无需人工介入
+#
+#  v1.2 修复: 移除阶段1的 fsck.f2fs -f (挂载中的 f2fs 卷不可 fsck, 会损坏)
+#             移除等待 30s, 立即重启
 # ============================================================
 
 set -u
 LOG=/tmp/expand-overlay.log
-echo "=== OpenWrt overlay 全自动扩容 v1.1 ===" | tee $LOG
+echo "=== OpenWrt overlay 全自动扩容 v1.2 ===" | tee $LOG
 
 # ---------- 0. 环境检测 ----------
 echo "--- 0. 环境检测 ---" | tee -a $LOG
@@ -117,6 +120,7 @@ cat > /etc/uci-defaults/80-rootfs-resize <<'STAGE1'
 #!/bin/sh
 # 阶段1: 重启后由 uci-defaults 自动执行 (开机时 uci_apply_defaults 运行一次)
 # 动态检测设备, 不依赖硬编码路径
+# v1.2: 移除 fsck.f2fs -f (挂载中的卷不可 fsck); 仅 mount/umount 重放日志 + resize
 LOG=/tmp/expand-stage1.log
 echo "=== [stage1] resize overlay f2fs ===" > $LOG
 
@@ -134,10 +138,15 @@ echo "root=$ROOT_DEV overlay_src=$OVERLAY_SRC offset=$OFFSET" >> $LOG
 NEW_LOOP="$(losetup -f)"
 echo "new loop: $NEW_LOOP" >> $LOG
 losetup -o "$OFFSET" "$NEW_LOOP" "$ROOT_DEV" || { echo "losetup failed" >> $LOG; exit 1; }
-echo "loop size: $(cat /sys/block/${NEW_LOOP#/dev/}/size) sectors" >> $LOG
+NEW_SIZE="$(cat /sys/block/${NEW_LOOP#/dev/}/size)"
+echo "new loop size: $NEW_SIZE sectors" >> $LOG
 
-# fsck (重放日志前先检查, 失败不阻断)
-fsck.f2fs -f "$NEW_LOOP" >> $LOG 2>&1 || true
+# 防御: 新 loop 必须大于旧卷 (290M=594176 sectors), 否则说明分区没扩成功
+if [ "${NEW_SIZE:-0}" -lt 1000000 ]; then
+    echo "ERROR: loop 太小 ($NEW_SIZE), 分区可能未扩大, 中止" >> $LOG
+    losetup -d "$NEW_LOOP" 2>/dev/null
+    exit 1
+fi
 
 # mount/umount 重放日志 (unclean 时 resize 会拒绝; 挂载失败可容忍, 继续尝试 resize)
 mkdir -p /mnt/expand
@@ -161,9 +170,8 @@ if [ $RC -ne 0 ]; then
 fi
 
 touch /etc/rootfs-resize-done
-echo "扩容完成, 10s 后自动重启" >> $LOG
+echo "扩容完成, 立即重启" >> $LOG
 sync
-sleep 10
 reboot
 exit 1
 STAGE1
@@ -171,8 +179,7 @@ chmod +x /etc/uci-defaults/80-rootfs-resize
 echo "已写入 /etc/uci-defaults/80-rootfs-resize" | tee -a $LOG
 
 # ---------- 5. 触发重启 ----------
-echo "--- 5. 分区已扩, 30s 后自动重启进入阶段1 ---" | tee -a $LOG
+echo "--- 5. 分区已扩, 立即重启进入阶段1 ---" | tee -a $LOG
 echo "重启后无需任何操作, 将自动完成 f2fs 扩容并再次重启" | tee -a $LOG
 sync
-sleep 30
 reboot
